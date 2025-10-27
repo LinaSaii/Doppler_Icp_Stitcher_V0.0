@@ -176,7 +176,7 @@ public:
         declare_parameter("velocity_threshold", std::vector<double>{0.1});
         declare_parameter("downsample_factor", std::vector<int>{1});  
         declare_parameter("max_iterations", std::vector<int>{50});     
-        declare_parameter("icp_tolerance", std::vector<double>{1e-6});    
+        declare_parameter("icp_tolerance", std::vector<double>{1e-9});    
         declare_parameter("publish_rate", std::vector<double>{10.0});
         declare_parameter("lambda_doppler_start", std::vector<double>{0.0});
         declare_parameter("lambda_doppler_end", std::vector<double>{0.0});
@@ -186,7 +186,7 @@ public:
         declare_parameter("t_vl_y", std::vector<double>{0.0});
         declare_parameter("t_vl_z", std::vector<double>{0.0});
         declare_parameter("reject_outliers", std::vector<bool>{true});
-        declare_parameter("outlier_thresh", std::vector<double>{0.05});
+        declare_parameter("outlier_thresh", std::vector<double>{0.001});
         declare_parameter("rejection_min_iters", std::vector<int>{2});
         declare_parameter("geometric_min_iters", std::vector<int>{0});
         declare_parameter("doppler_min_iters", std::vector<int>{2});
@@ -197,6 +197,10 @@ public:
         declare_parameter("last_n_frames", std::vector<int>{15});        
         declare_parameter("use_voxel_filter", std::vector<bool>{false});
         declare_parameter("voxel_size", std::vector<double>{0.0001});
+        
+        // NEW: Adaptive normal estimation parameters
+        declare_parameter("normal_estimation_mode", std::vector<std::string>{"vertical"}); // "auto", "vertical", "estimated"
+        declare_parameter("static_scene_threshold", std::vector<double>{0.5}); // Z-variance threshold for static scene detection
 
         frames_dir_ = get_parameter("frames_directory").as_string();
         output_csv_path_ = get_parameter("output_csv_path").as_string();
@@ -207,8 +211,11 @@ public:
         // NEW: Set initial parameters
         set_current_parameters(0);
 
-        // NEW: Enhanced CSV file initialization - ONLY ONCE at start
+        // NEW: Enhanced CSV file initialization
         initialize_csv_file();
+
+        // NEW: Initialize logs file
+        initialize_logs_file();
 
         // Load CSV files
         for (auto& entry : fs::directory_iterator(frames_dir_)) {
@@ -252,6 +259,12 @@ public:
             csv_file_.close();
             RCLCPP_INFO(get_logger(), "Enhanced trajectory saved to: %s", excel_filename_.c_str());
         }
+        
+        // NEW: Close logs file
+        if (logs_file_.is_open()) {
+            logs_file_.close();
+            RCLCPP_INFO(get_logger(), "Execution logs saved to: %s", logs_filename_.c_str());
+        }
     }
 
 private:
@@ -281,6 +294,21 @@ private:
         int last_n_frames;
         bool use_voxel_filter;
         double voxel_size;
+        
+        // NEW: Adaptive normal estimation parameters
+        std::string normal_estimation_mode;
+        double static_scene_threshold;
+    };
+
+    // NEW: Frame statistics structure for logs
+    struct FrameStats {
+        size_t frame_index;
+        size_t initial_points;
+        size_t filtered_points;
+        int iterations_used;
+        double processing_time_ms;
+        std::string filename;
+        size_t parameter_set_index;
     };
 
     // NEW: Initialize all parameter combinations
@@ -309,6 +337,10 @@ private:
         auto last_n_frames_list = get_parameter("last_n_frames").as_integer_array();
         auto use_voxel_filter_list = get_parameter("use_voxel_filter").as_bool_array();
         auto voxel_sizes = get_parameter("voxel_size").as_double_array();
+        
+        // NEW: Adaptive normal estimation parameters
+        auto normal_estimation_modes = get_parameter("normal_estimation_mode").as_string_array();
+        auto static_scene_thresholds = get_parameter("static_scene_threshold").as_double_array();
 
         // Create all combinations (for simplicity, using the first combination approach)
         // You can extend this to generate all possible combinations if needed
@@ -320,7 +352,8 @@ private:
             outlier_thresh_list.size(), rejection_min_iters_list.size(), geometric_min_iters_list.size(),
             doppler_min_iters_list.size(), geometric_k_list.size(), doppler_k_list.size(),
             max_corr_distances.size(), min_inliers_list.size(), last_n_frames_list.size(),
-            use_voxel_filter_list.size(), voxel_sizes.size()
+            use_voxel_filter_list.size(), voxel_sizes.size(),
+            normal_estimation_modes.size(), static_scene_thresholds.size()
         });
 
         parameter_sets_.reserve(max_size);
@@ -351,6 +384,10 @@ private:
             params.last_n_frames = i < last_n_frames_list.size() ? last_n_frames_list[i] : last_n_frames_list[0];
             params.use_voxel_filter = i < use_voxel_filter_list.size() ? use_voxel_filter_list[i] : use_voxel_filter_list[0];
             params.voxel_size = i < voxel_sizes.size() ? voxel_sizes[i] : voxel_sizes[0];
+            
+            // NEW: Adaptive normal estimation parameters
+            params.normal_estimation_mode = i < normal_estimation_modes.size() ? normal_estimation_modes[i] : normal_estimation_modes[0];
+            params.static_scene_threshold = i < static_scene_thresholds.size() ? static_scene_thresholds[i] : static_scene_thresholds[0];
 
             parameter_sets_.push_back(params);
         }
@@ -393,11 +430,17 @@ private:
         last_n_frames_ = params.last_n_frames;
         use_voxel_filter_ = params.use_voxel_filter;
         voxel_size_ = params.voxel_size;
+        
+        // NEW: Adaptive normal estimation parameters
+        normal_estimation_mode_ = params.normal_estimation_mode;
+        static_scene_threshold_ = params.static_scene_threshold;
 
         RCLCPP_INFO(get_logger(), "Set parameter combination %zu/%zu", param_index + 1, parameter_sets_.size());
+        RCLCPP_INFO(get_logger(), "Normal estimation mode: %s, Static scene threshold: %.3f", 
+                   normal_estimation_mode_.c_str(), static_scene_threshold_);
     }
 
-    // NEW: Enhanced CSV file initialization - ONLY ONCE at start
+    // NEW: Enhanced CSV file initialization
     void initialize_csv_file() {
         // Create icp_pose directory
         icp_pose_dir_ = "icp_pose";
@@ -417,7 +460,7 @@ private:
         }
         
         // Enhanced header with all parameters
-        csv_file_ << "header_stamp_sec,header_stamp_nanosec,header_frame_id,"
+        csv_file_ << "timestamp,header_frame_id,"
                  << "position_x,position_y,position_z,"
                  << "orientation_x,orientation_y,orientation_z,orientation_w,"
                  << "timestamp,velocity_threshold,downsample_factor,max_iterations,icp_tolerance,"
@@ -425,11 +468,54 @@ private:
                  << "t_vl_x,t_vl_y,t_vl_z,reject_outliers,outlier_thresh,rejection_min_iters,"
                  << "geometric_min_iters,doppler_min_iters,geometric_k,doppler_k,max_corr_distance,"
                  << "min_inliers,last_n_frames,frame_timestamp_seconds,frame_timestamp_nanoseconds,"
-                 << "use_voxel_filter,voxel_size,parameter_set_index\n";
+                 << "use_voxel_filter,voxel_size,parameter_set_index,"
+                 << "normal_estimation_mode,static_scene_threshold\n";
         csv_file_.flush();
         
         RCLCPP_INFO(get_logger(), "Initialized enhanced trajectory CSV file: %s", excel_filename_.c_str());
         RCLCPP_INFO(get_logger(), "All parameter combinations will be saved to this file");
+    }
+
+    // NEW: Initialize logs file for execution statistics
+    void initialize_logs_file() {
+        // Create logs directory
+        logs_dir_ = "logs";
+        std::filesystem::create_directories(logs_dir_);
+        
+        // Create filename with execution date
+        auto now = std::chrono::system_clock::now();
+        auto now_time_t = std::chrono::system_clock::to_time_t(now);
+        std::stringstream filename;
+        filename << "logs_time_execution_" << now_time_t << ".csv";
+        logs_filename_ = logs_dir_ + "/" + filename.str();
+        
+        logs_file_.open(logs_filename_, std::ios::out | std::ios::trunc);
+        if (!logs_file_.is_open()) {
+            RCLCPP_ERROR(get_logger(), "Failed to open logs CSV file: %s", logs_filename_.c_str());
+            return;
+        }
+        
+        // Header for logs file
+        logs_file_ << "frame_index,filename,initial_points,filtered_points,"
+                  << "iterations_used,processing_time_ms\n";
+        logs_file_.flush();
+        
+        RCLCPP_INFO(get_logger(), "Initialized execution logs file: %s", logs_filename_.c_str());
+    }
+
+    // NEW: Save frame statistics to logs file
+    void save_frame_stats_to_logs(const FrameStats& stats) {
+        if (!logs_file_.is_open()) return;
+        
+        logs_file_ << std::fixed << std::setprecision(6);
+        logs_file_ << stats.frame_index << ","
+                  << stats.filename << ","
+                  << stats.initial_points << ","
+                  << stats.filtered_points << ","
+                  << stats.iterations_used << ","
+                  << stats.processing_time_ms << "\n";
+        
+        logs_file_.flush();
     }
 
     // NEW: Enhanced pose saving with all parameters
@@ -445,7 +531,6 @@ private:
         // Write enhanced CSV data
         csv_file_ << std::fixed << std::setprecision(6);
         csv_file_ << current_time.seconds() << ","
-                  << current_time.nanoseconds() % 1000000000 << ","
                   << "map,"
                   << position.x() << ","
                   << position.y() << ","
@@ -480,9 +565,38 @@ private:
                   << frame_data.frame_timestamp_nanoseconds << ","
                   << (use_voxel_filter_ ? "true" : "false") << ","
                   << voxel_size_ << ","
-                  << current_param_index_ << "\n";
+                  << current_param_index_ << ","
+                  << current_normal_mode_ << ","
+                  << static_scene_threshold_ << "\n";
         
         csv_file_.flush();
+    }
+
+    // NEW: Detect if scene is static based on point cloud characteristics
+    bool is_static_scene(const Eigen::MatrixXd& points) {
+        if (points.rows() == 0) return true;
+        
+        // Calculate variance in z-axis
+        double z_mean = 0.0;
+        for (int i = 0; i < points.rows(); ++i) {
+            z_mean += points(i, 2);
+        }
+        z_mean /= points.rows();
+        
+        double z_variance = 0.0;
+        for (int i = 0; i < points.rows(); ++i) {
+            z_variance += (points(i, 2) - z_mean) * (points(i, 2) - z_mean);
+        }
+        z_variance /= points.rows();
+        
+        // Static scenes typically have low z-variance (flat environments)
+        // Dynamic scenes have higher z-variance (varied terrain during movement)
+        bool is_static = z_variance < static_scene_threshold_;
+        
+        RCLCPP_DEBUG(get_logger(), "Scene detection - Z variance: %.4f, Static: %s", 
+                     z_variance, is_static ? "true" : "false");
+        
+        return is_static;
     }
 
     // ================= Async Pipeline Methods =================
@@ -559,6 +673,7 @@ private:
         temp_data.reserve(10000);
         
         size_t total_points = 0;
+        size_t filtered_points = 0; // NEW: Track filtered points
         bool first_valid_row = true; // NEW: For timestamp extraction
         
         while (std::getline(in, line)) {
@@ -591,6 +706,7 @@ private:
                 Eigen::Vector4d entry;
                 entry << std::stod(row[x_idx]), std::stod(row[y_idx]), std::stod(row[z_idx]), v_radial;
                 temp_data.push_back(entry);
+                filtered_points++; // NEW: Count filtered points
             }
         }
 
@@ -603,8 +719,12 @@ private:
             data.velocities(i) = temp_data[i](3);
         }
 
+        // NEW: Store point count statistics
+        current_frame_initial_points_ = total_points;
+        current_frame_filtered_points_ = filtered_points;
+
         RCLCPP_DEBUG(get_logger(), "Loaded %s: %zu points, %zu after filtering, timestamps: %.6fs, %.0fns",
-                    fs::path(filename).filename().c_str(), total_points, N,
+                    fs::path(filename).filename().c_str(), total_points, filtered_points,
                     data.frame_timestamp_seconds, data.frame_timestamp_nanoseconds);
         return data;
     }
@@ -636,8 +756,35 @@ private:
 
         if (pcd_down->points_.empty()) return output;
 
-        // Estimate normals with optimized parameters
-        pcd_down->EstimateNormals(open3d::geometry::KDTreeSearchParamHybrid(5.0, 20));
+        // NEW: Adaptive normal estimation strategy
+        bool use_vertical_normals = false;
+        std::string current_normal_mode = normal_estimation_mode_;
+        
+        // Determine normal estimation strategy
+        if (normal_estimation_mode_ == "vertical") {
+            use_vertical_normals = true;
+            current_normal_mode = "vertical";
+        } else if (normal_estimation_mode_ == "estimated") {
+            use_vertical_normals = false;
+            current_normal_mode = "estimated";
+        } else { // "auto" mode - detect scene type
+            bool is_static = is_static_scene(input.points);
+            use_vertical_normals = is_static;
+            current_normal_mode = use_vertical_normals ? "auto_vertical" : "auto_estimated";
+        }
+        
+        // Store the current normal mode for logging
+        current_normal_mode_ = current_normal_mode;
+
+        if (use_vertical_normals) {
+            RCLCPP_INFO(get_logger(), "Using VERTICAL NORMALS for static scene");
+            // Don't estimate normals, we'll set them to vertical
+            pcd_down->normals_.resize(pcd_down->points_.size(), Eigen::Vector3d(0.0, 0.0, 1.0));
+        } else {
+            RCLCPP_INFO(get_logger(), "Using ESTIMATED NORMALS for dynamic scene");
+            // Estimate normals with optimized parameters (existing behavior)
+            pcd_down->EstimateNormals(open3d::geometry::KDTreeSearchParamHybrid(5.0, 20));
+        }
 
         size_t M = pcd_down->points_.size();
         output.points.resize(M, 3);
@@ -737,7 +884,11 @@ private:
         const Eigen::MatrixXd& d_unit = src.unit_directions;
         Eigen::MatrixXd r_vecs = src.points.rowwise() + t_vl.transpose();
 
+        int actual_iterations_used = 0; // NEW: Track actual iterations used
+
         for (int it = 0; it < max_iter; ++it) {
+            actual_iterations_used = it + 1; // NEW: Track iteration count
+            
             // Lambda scheduling
             double lam = lambda_end;
             if (lambda_iters > 0) {
@@ -777,7 +928,7 @@ private:
             }
 
             if (inlier_count < min_inliers) {
-                RCLCPP_WARN(get_logger(), "Insufficient inliers (%d < %d)", inlier_count, min_inliers);
+                RCLCPP_WARN(get_logger(), "Insufficient inliers (%d < %d), breaking ICP", inlier_count, min_inliers);
                 break;
             }
 
@@ -861,6 +1012,9 @@ private:
         auto duration = std::chrono::duration_cast<std::chrono::milliseconds>(end_time - start_time);
         RCLCPP_DEBUG(get_logger(), "ICP took %ld ms", duration.count());
 
+        // NEW: Store iterations used for logging
+        current_frame_iterations_ = actual_iterations_used;
+
         return {transformation, prev_error};
     }
 
@@ -937,6 +1091,18 @@ private:
             
             // NEW: Enhanced pose saving with all parameters
             save_pose_to_csv(frame_idx_, current_pose_, frame_data);
+            
+            // NEW: Save frame statistics to logs
+            FrameStats stats;
+            stats.frame_index = frame_idx_;
+            stats.filename = fs::path(frame_files_[frame_idx_]).filename().string();
+            stats.parameter_set_index = current_param_index_;
+            stats.initial_points = current_frame_initial_points_;
+            stats.filtered_points = current_frame_filtered_points_;
+            stats.iterations_used = 0; // No ICP for first frame
+            stats.processing_time_ms = 0.0;
+            save_frame_stats_to_logs(stats);
+            
             RCLCPP_INFO(get_logger(), "Processed initial frame %zu with param set %zu", frame_idx_, current_param_index_);
         } else {
             auto [transform_sp2tp, error] = doppler_icp(previous_frame_, frame_data);
@@ -961,8 +1127,20 @@ private:
 
             auto frame_end = std::chrono::high_resolution_clock::now();
             auto frame_duration = std::chrono::duration_cast<std::chrono::milliseconds>(frame_end - frame_start);
-            RCLCPP_INFO(get_logger(), "Frame %zu: error=%.4f, time=%ld ms, param_set=%zu", 
-                       frame_idx_, error, frame_duration.count(), current_param_index_);
+
+            // NEW: Save frame statistics to logs
+            FrameStats stats;
+            stats.frame_index = frame_idx_;
+            stats.filename = fs::path(frame_files_[frame_idx_]).filename().string();
+            stats.parameter_set_index = current_param_index_;
+            stats.initial_points = current_frame_initial_points_;
+            stats.filtered_points = current_frame_filtered_points_;
+            stats.iterations_used = current_frame_iterations_;
+            stats.processing_time_ms = frame_duration.count();
+            save_frame_stats_to_logs(stats);
+            
+            RCLCPP_INFO(get_logger(), "Frame %zu: error=%.4f, time=%ld ms, param_set=%zu, iterations=%d", 
+                       frame_idx_, error, frame_duration.count(), current_param_index_, current_frame_iterations_);
         }
 
         previous_frame_ = frame_data;
@@ -1138,10 +1316,20 @@ private:
     int last_n_frames_;
     bool use_voxel_filter_;
     double voxel_size_;
+    
+    // NEW: Adaptive normal estimation parameters
+    std::string normal_estimation_mode_;
+    double static_scene_threshold_;
+    std::string current_normal_mode_ = "estimated";
 
     // NEW: Parameter combinations
     std::vector<ParameterSet> parameter_sets_;
     size_t current_param_index_ = 0;
+
+    // NEW: Frame statistics tracking
+    size_t current_frame_initial_points_ = 0;
+    size_t current_frame_filtered_points_ = 0;
+    int current_frame_iterations_ = 0;
 
     size_t frame_idx_;
     std::vector<std::string> frame_files_;
@@ -1155,6 +1343,11 @@ private:
     std::ofstream csv_file_;
     std::string icp_pose_dir_;
     std::string excel_filename_;
+
+    // NEW: Logs file variables
+    std::ofstream logs_file_;
+    std::string logs_dir_;
+    std::string logs_filename_;
 
     // ================= Real-time Pipeline Members =================
     std::unique_ptr<AsyncPreprocessor> preprocessor_;
