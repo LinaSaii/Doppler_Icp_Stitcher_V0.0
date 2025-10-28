@@ -31,6 +31,12 @@
 #include <functional>
 #include <ctime>
 
+// MCAP recording includes
+#include <rosbag2_cpp/writer.hpp>
+#include <rosbag2_cpp/writers/sequential_writer.hpp>
+#include <rosbag2_storage/storage_options.hpp>
+#include <rosbag2_cpp/storage_options.hpp>
+
 using namespace std::chrono_literals;
 namespace fs = std::filesystem;
 
@@ -167,16 +173,23 @@ private:
 // ================= Doppler ICP Node =================
 class DopplerICPStitcher : public rclcpp::Node {
 public:
-    DopplerICPStitcher() : Node("doppler_icp_stitcher"), preprocessor_(std::make_unique<AsyncPreprocessor>()) {
+    DopplerICPStitcher() : Node("doppler_icp_stitcher"), 
+                          preprocessor_(std::make_unique<AsyncPreprocessor>()),
+                          target_frame_time_(0.0),
+                          enable_recording_(false) {
         // Parameters with lists for multiple executions
-        declare_parameter("frames_directory", "/home/zassi/test_lidar/data/outdoor/outdoor_stationary_scene/outdoor_stationary_scene/stationary_six_column_csv");
+        declare_parameter("frames_directory", "/home/zassi/test_lidar/data/indooor_sparse/sparse_six_column");
         declare_parameter("output_csv_path", "/home/zassi/ros2_ws/icp_pose/outdoor.csv");
         
+        // NEW: MCAP recording parameters
+        declare_parameter("enable_recording", true);
+        declare_parameter("recording_directory", "./recordings");
+        
         // NEW: Parameter lists for multiple executions
-        declare_parameter("velocity_threshold", std::vector<double>{0.1});
+        declare_parameter("velocity_threshold", std::vector<double>{5.0});
         declare_parameter("downsample_factor", std::vector<int>{1});  
-        declare_parameter("max_iterations", std::vector<int>{50});     
-        declare_parameter("icp_tolerance", std::vector<double>{1e-9});    
+        declare_parameter("max_iterations", std::vector<int>{10});     
+        declare_parameter("icp_tolerance", std::vector<double>{1e-2});    
         declare_parameter("publish_rate", std::vector<double>{10.0});
         declare_parameter("lambda_doppler_start", std::vector<double>{0.0});
         declare_parameter("lambda_doppler_end", std::vector<double>{0.0});
@@ -184,26 +197,34 @@ public:
         declare_parameter("frame_dt", std::vector<double>{0.1});
         declare_parameter("t_vl_x", std::vector<double>{0.0});
         declare_parameter("t_vl_y", std::vector<double>{0.0});
-        declare_parameter("t_vl_z", std::vector<double>{0.0});
+        declare_parameter("t_vl_z", std::vector<double>{0.604});
         declare_parameter("reject_outliers", std::vector<bool>{true});
-        declare_parameter("outlier_thresh", std::vector<double>{0.001});
+        declare_parameter("outlier_thresh", std::vector<double>{1.0});
         declare_parameter("rejection_min_iters", std::vector<int>{2});
         declare_parameter("geometric_min_iters", std::vector<int>{0});
         declare_parameter("doppler_min_iters", std::vector<int>{2});
-        declare_parameter("geometric_k", std::vector<double>{0.2});
-        declare_parameter("doppler_k", std::vector<double>{0.3});
-        declare_parameter("max_corr_distance", std::vector<double>{0.1});  
+        declare_parameter("geometric_k", std::vector<double>{0.1});
+        declare_parameter("doppler_k", std::vector<double>{0.15});
+        declare_parameter("max_corr_distance", std::vector<double>{0.2});  
         declare_parameter("min_inliers", std::vector<int>{5});
-        declare_parameter("last_n_frames", std::vector<int>{15});        
+        declare_parameter("last_n_frames", std::vector<int>{5});        
         declare_parameter("use_voxel_filter", std::vector<bool>{false});
         declare_parameter("voxel_size", std::vector<double>{0.0001});
         
         // NEW: Adaptive normal estimation parameters
-        declare_parameter("normal_estimation_mode", std::vector<std::string>{"vertical"}); // "auto", "vertical", "estimated"
+        declare_parameter("normal_estimation_mode", std::vector<std::string>{"estimated"}); // "auto", "vertical", "estimated"
         declare_parameter("static_scene_threshold", std::vector<double>{0.5}); // Z-variance threshold for static scene detection
 
         frames_dir_ = get_parameter("frames_directory").as_string();
         output_csv_path_ = get_parameter("output_csv_path").as_string();
+        
+        // NEW: MCAP recording initialization
+        enable_recording_ = get_parameter("enable_recording").as_bool();
+        recording_directory_ = get_parameter("recording_directory").as_string();
+        
+        if (enable_recording_) {
+            initialize_recording();
+        }
         
         // NEW: Initialize parameter combinations
         initialize_parameter_combinations();
@@ -244,6 +265,10 @@ public:
         previous_frame_set_ = false;
         preprocessing_next_frame_.store(false);
 
+        // NEW: Initialize timing variables for frame rate control
+        last_frame_time_ = std::chrono::steady_clock::now();
+        first_frame_processed_ = false;
+
         // Start preprocessing next frame immediately if available
         if (frame_files_.size() > 1) {
             start_async_preprocessing(next_frame_idx_);
@@ -264,6 +289,13 @@ public:
         if (logs_file_.is_open()) {
             logs_file_.close();
             RCLCPP_INFO(get_logger(), "Execution logs saved to: %s", logs_filename_.c_str());
+        }
+        
+        // NEW: Close MCAP recording
+        if (bag_writer_) {
+            bag_writer_->close();
+            RCLCPP_INFO(get_logger(), "MCAP recording saved: %s/%s", 
+                       recording_directory_.c_str(), recording_filename_.c_str());
         }
     }
 
@@ -310,6 +342,85 @@ private:
         std::string filename;
         size_t parameter_set_index;
     };
+
+    // NEW: Timing control variables - FIXED: Remove assignment in constructor
+    std::chrono::steady_clock::time_point last_frame_time_;
+    bool first_frame_processed_;
+    const double target_frame_time_;  // FIXED: Initialize in member initializer list
+
+    // NEW: MCAP recording variables
+    std::unique_ptr<rosbag2_cpp::Writer> bag_writer_;
+    bool enable_recording_;
+    std::string recording_directory_;
+    std::string recording_filename_;
+
+    // NEW: Initialize MCAP recording
+    void initialize_recording() {
+        // Create recording directory
+        std::filesystem::create_directories(recording_directory_);
+        
+        // Generate filename with timestamp
+        auto now = std::chrono::system_clock::now();
+        auto now_time_t = std::chrono::system_clock::to_time_t(now);
+        std::tm now_tm = *std::localtime(&now_time_t);
+        
+        std::stringstream filename;
+        filename << "doppler_icp_"
+                 << std::put_time(&now_tm, "%Y%m%d_%H%M%S");
+        
+        recording_filename_ = filename.str();
+        std::string full_path = recording_directory_ + "/" + recording_filename_;
+        
+        try {
+            bag_writer_ = std::make_unique<rosbag2_cpp::Writer>();
+            
+            rosbag2_storage::StorageOptions storage_options;
+            storage_options.uri = full_path;
+            storage_options.storage_id = "sqlite3";
+            
+            bag_writer_->open(storage_options);
+            
+            // Create all topics explicitly
+            std::vector<std::pair<std::string, std::string>> topics = {
+                {"stitched_cloud", "sensor_msgs/msg/PointCloud2"},
+                {"icp_pose", "geometry_msgs/msg/PoseStamped"},
+                {"icp_trajectory", "geometry_msgs/msg/PoseArray"},
+                {"linear_acceleration", "geometry_msgs/msg/Vector3Stamped"},
+                {"angular_velocity", "geometry_msgs/msg/Vector3Stamped"}
+            };
+            
+            for (const auto& [topic_name, topic_type] : topics) {
+                rosbag2_storage::TopicMetadata topic_metadata;
+                topic_metadata.name = topic_name;
+                topic_metadata.type = topic_type;
+                topic_metadata.serialization_format = "cdr";
+                bag_writer_->create_topic(topic_metadata);
+            }
+            
+            RCLCPP_INFO(get_logger(), "Started SQLite3 recording with all topics: %s", (full_path + ".db3").c_str());
+            
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(get_logger(), "Failed to initialize recording: %s", e.what());
+            RCLCPP_WARN(get_logger(), "Continuing without recording");
+            enable_recording_ = false;
+            bag_writer_.reset();
+        }
+    }
+    // NEW: Record message to MCAP
+    template<typename T>
+    void record_message(const T& message, const std::string& topic_name) {
+        if (!enable_recording_ || !bag_writer_) {
+            return;
+        }
+        
+        try {
+            // Simple write - let rosbag2 handle serialization
+            bag_writer_->write(message, topic_name, now());
+        } catch (const std::exception& e) {
+            RCLCPP_ERROR(get_logger(), "Failed to record message on topic %s: %s", 
+                        topic_name.c_str(), e.what());
+        }
+    }
 
     // NEW: Initialize all parameter combinations
     void initialize_parameter_combinations() {
@@ -1020,6 +1131,30 @@ private:
 
     // ================= Process Next Frame =================
     void process_next_frame() {
+        auto frame_start = std::chrono::steady_clock::now();
+        
+        // NEW: Wait logic for maintaining exact 0.1s intervals
+        if (first_frame_processed_) {
+            auto elapsed = std::chrono::duration_cast<std::chrono::duration<double>>(
+                frame_start - last_frame_time_);
+            
+            if (elapsed.count() < target_frame_time_) {
+                auto wait_time = std::chrono::duration<double>(target_frame_time_ - elapsed.count());
+                auto wait_start = std::chrono::steady_clock::now();
+                
+                std::this_thread::sleep_for(wait_time);
+                
+                auto actual_wait = std::chrono::duration_cast<std::chrono::duration<double>>(
+                    std::chrono::steady_clock::now() - wait_start);
+                
+                RCLCPP_DEBUG(get_logger(), 
+                            "Waited %.3f/%.3f seconds to maintain frame rate", 
+                            actual_wait.count(), wait_time.count());
+                
+                frame_start = std::chrono::steady_clock::now();
+            }
+        }
+
         if (frame_idx_ >= frame_files_.size()) {
             RCLCPP_INFO(get_logger(), "All frames processed for parameter set %zu", current_param_index_);
             
@@ -1038,6 +1173,10 @@ private:
                 trajectory_.clear();
                 current_pose_ = Eigen::Matrix4d::Identity();
                 
+                // NEW: Reset timing for new parameter set
+                last_frame_time_ = std::chrono::steady_clock::now();
+                first_frame_processed_ = false;
+                
                 RCLCPP_INFO(get_logger(), "Starting processing with parameter set %zu/%zu", 
                            current_param_index_ + 1, parameter_sets_.size());
                 
@@ -1053,8 +1192,6 @@ private:
             }
             return;
         }
-
-        auto frame_start = std::chrono::high_resolution_clock::now();
 
         // Get current frame (may be preprocessed async)
         PointCloudData frame_data;
@@ -1100,7 +1237,9 @@ private:
             stats.initial_points = current_frame_initial_points_;
             stats.filtered_points = current_frame_filtered_points_;
             stats.iterations_used = 0; // No ICP for first frame
-            stats.processing_time_ms = 0.0;
+            auto frame_end = std::chrono::steady_clock::now();
+            auto frame_duration = std::chrono::duration_cast<std::chrono::milliseconds>(frame_end - frame_start);
+            stats.processing_time_ms = frame_duration.count();
             save_frame_stats_to_logs(stats);
             
             RCLCPP_INFO(get_logger(), "Processed initial frame %zu with param set %zu", frame_idx_, current_param_index_);
@@ -1125,7 +1264,7 @@ private:
             Eigen::AngleAxisd aa(delta_R);
             ang_vel = aa.axis() * aa.angle() / dt;
 
-            auto frame_end = std::chrono::high_resolution_clock::now();
+            auto frame_end = std::chrono::steady_clock::now();
             auto frame_duration = std::chrono::duration_cast<std::chrono::milliseconds>(frame_end - frame_start);
 
             // NEW: Save frame statistics to logs
@@ -1150,6 +1289,10 @@ private:
         publish_lin_acc_ang_vel(lin_acc, ang_vel);
         publish_tf();
 
+        // NEW: Update timing for next frame
+        last_frame_time_ = std::chrono::steady_clock::now();
+        first_frame_processed_ = true;
+        
         frame_idx_++;
     }
 
@@ -1202,6 +1345,9 @@ private:
         }
 
         pointcloud_pub_->publish(msg);
+        
+        // NEW: Record to MCAP
+        record_message(msg, "stitched_cloud");
     }
 
     void publish_current_pose() {
@@ -1221,6 +1367,9 @@ private:
         pose_msg.pose.orientation.w = q.w();
 
         pose_pub_->publish(pose_msg);
+        
+        // NEW: Record to MCAP
+        record_message(pose_msg, "icp_pose");
     }
 
     void publish_trajectory() {
@@ -1248,6 +1397,9 @@ private:
         }
 
         trajectory_pub_->publish(pose_array);
+        
+        // NEW: Record to MCAP
+        record_message(pose_array, "icp_trajectory");
     }
 
     void publish_lin_acc_ang_vel(const Eigen::Vector3d& lin_acc, const Eigen::Vector3d& ang_vel) {
@@ -1266,6 +1418,10 @@ private:
         ang_msg.vector.y = ang_vel.y();
         ang_msg.vector.z = ang_vel.z();
         ang_vel_pub_->publish(ang_msg);
+        
+        // NEW: Record to MCAP
+        record_message(lin_msg, "linear_acceleration");
+        record_message(ang_msg, "angular_velocity");
     }
 
     void publish_tf() {
@@ -1354,6 +1510,8 @@ private:
     std::future<PointCloudData> next_frame_future_;
     std::atomic<bool> preprocessing_next_frame_{false};
     size_t next_frame_idx_{1};
+
+    
 
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_pub_;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub_;
