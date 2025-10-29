@@ -33,9 +33,7 @@
 
 // MCAP recording includes
 #include <rosbag2_cpp/writer.hpp>
-#include <rosbag2_cpp/writers/sequential_writer.hpp>
 #include <rosbag2_storage/storage_options.hpp>
-#include <rosbag2_cpp/storage_options.hpp>
 
 using namespace std::chrono_literals;
 namespace fs = std::filesystem;
@@ -178,7 +176,7 @@ public:
                           target_frame_time_(0.0),
                           enable_recording_(false) {
         // Parameters with lists for multiple executions
-        declare_parameter("frames_directory", "/home/zassi/test_lidar/data/indooor_sparse/sparse_six_column");
+        declare_parameter("frames_directory", "/home/zassi/test_lidar/data/indoore_dence/dense_six_column");
         declare_parameter("output_csv_path", "/home/zassi/ros2_ws/icp_pose/outdoor.csv");
         
         // NEW: MCAP recording parameters
@@ -343,10 +341,10 @@ private:
         size_t parameter_set_index;
     };
 
-    // NEW: Timing control variables - FIXED: Remove assignment in constructor
+    // NEW: Timing control variables
     std::chrono::steady_clock::time_point last_frame_time_;
     bool first_frame_processed_;
-    const double target_frame_time_;  // FIXED: Initialize in member initializer list
+    const double target_frame_time_;
 
     // NEW: MCAP recording variables
     std::unique_ptr<rosbag2_cpp::Writer> bag_writer_;
@@ -366,7 +364,8 @@ private:
         
         std::stringstream filename;
         filename << "doppler_icp_"
-                 << std::put_time(&now_tm, "%Y%m%d_%H%M%S");
+                 << std::put_time(&now_tm, "%Y%m%d_%H%M%S")
+                 << ".mcap";
         
         recording_filename_ = filename.str();
         std::string full_path = recording_directory_ + "/" + recording_filename_;
@@ -376,36 +375,21 @@ private:
             
             rosbag2_storage::StorageOptions storage_options;
             storage_options.uri = full_path;
-            storage_options.storage_id = "sqlite3";
+            storage_options.storage_id = "mcap";
             
+            // Don't specify converter options - use defaults
             bag_writer_->open(storage_options);
             
-            // Create all topics explicitly
-            std::vector<std::pair<std::string, std::string>> topics = {
-                {"stitched_cloud", "sensor_msgs/msg/PointCloud2"},
-                {"icp_pose", "geometry_msgs/msg/PoseStamped"},
-                {"icp_trajectory", "geometry_msgs/msg/PoseArray"},
-                {"linear_acceleration", "geometry_msgs/msg/Vector3Stamped"},
-                {"angular_velocity", "geometry_msgs/msg/Vector3Stamped"}
-            };
-            
-            for (const auto& [topic_name, topic_type] : topics) {
-                rosbag2_storage::TopicMetadata topic_metadata;
-                topic_metadata.name = topic_name;
-                topic_metadata.type = topic_type;
-                topic_metadata.serialization_format = "cdr";
-                bag_writer_->create_topic(topic_metadata);
-            }
-            
-            RCLCPP_INFO(get_logger(), "Started SQLite3 recording with all topics: %s", (full_path + ".db3").c_str());
+            RCLCPP_INFO(get_logger(), "Started MCAP recording: %s", full_path.c_str());
             
         } catch (const std::exception& e) {
-            RCLCPP_ERROR(get_logger(), "Failed to initialize recording: %s", e.what());
-            RCLCPP_WARN(get_logger(), "Continuing without recording");
+            RCLCPP_ERROR(get_logger(), "Failed to initialize MCAP recording: %s", e.what());
+            RCLCPP_WARN(get_logger(), "Continuing without MCAP recording");
             enable_recording_ = false;
             bag_writer_.reset();
         }
     }
+
     // NEW: Record message to MCAP
     template<typename T>
     void record_message(const T& message, const std::string& topic_name) {
@@ -414,7 +398,6 @@ private:
         }
         
         try {
-            // Simple write - let rosbag2 handle serialization
             bag_writer_->write(message, topic_name, now());
         } catch (const std::exception& e) {
             RCLCPP_ERROR(get_logger(), "Failed to record message on topic %s: %s", 
@@ -1510,8 +1493,6 @@ private:
     std::future<PointCloudData> next_frame_future_;
     std::atomic<bool> preprocessing_next_frame_{false};
     size_t next_frame_idx_{1};
-
-    
 
     rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr pointcloud_pub_;
     rclcpp::Publisher<geometry_msgs::msg::PoseStamped>::SharedPtr pose_pub_;
