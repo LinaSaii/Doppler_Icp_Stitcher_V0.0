@@ -30,6 +30,8 @@
 #include <condition_variable>
 #include <functional>
 #include <ctime>
+#include <map>
+#include <set>
 
 // MCAP recording includes
 #include <rosbag2_cpp/writer.hpp>
@@ -100,6 +102,122 @@ struct PointCloudData {
             if (norm < 1e-12) norm = 1.0;
             unit_directions.row(i) = points.row(i) / norm;
         }
+    }
+};
+
+// ================= Temporal Persistence Filter =================
+class TemporalPersistenceFilter {
+private:
+    struct PersistentPoint {
+        Eigen::Vector3d position;
+        int persistence_count;
+        int last_seen_frame;
+    };
+    
+    std::map<std::string, PersistentPoint> persistent_points_;
+    int current_frame_ = 0;
+    double voxel_size_ = 0.1; // 10cm voxel grid
+    int min_persistence_ = 5; // Must appear in 5 consecutive frames
+    
+public:
+    PointCloudData filter_non_persistent_points(const PointCloudData& new_frame) {
+        current_frame_++;
+        std::map<std::string, bool> current_frame_points;
+        
+        // Quantize current frame points
+        for (int i = 0; i < new_frame.points.rows(); ++i) {
+            Eigen::Vector3d pt = new_frame.points.row(i);
+            std::string key = quantize_point_key(pt);
+            current_frame_points[key] = true;
+        }
+        
+        // Update persistence counts
+        std::vector<std::string> to_remove;
+        for (auto& [key, persistent_pt] : persistent_points_) {
+            if (current_frame_points.find(key) != current_frame_points.end()) {
+                // Point still exists - increase persistence
+                persistent_pt.persistence_count++;
+                persistent_pt.last_seen_frame = current_frame_;
+            } else {
+                // Point disappeared - mark for removal if gone for too long
+                if (current_frame_ - persistent_pt.last_seen_frame > 2) {
+                    to_remove.push_back(key);
+                }
+            }
+        }
+        
+        // Remove old points
+        for (const auto& key : to_remove) {
+            persistent_points_.erase(key);
+        }
+        
+        // Add new points from current frame
+        for (int i = 0; i < new_frame.points.rows(); ++i) {
+            Eigen::Vector3d pt = new_frame.points.row(i);
+            std::string key = quantize_point_key(pt);
+            
+            if (persistent_points_.find(key) == persistent_points_.end()) {
+                persistent_points_[key] = {pt, 1, current_frame_};
+            }
+        }
+        
+        // Create output with only highly persistent points
+        return create_persistent_pointcloud(new_frame);
+    }
+    
+    void set_parameters(double voxel_size, int min_persistence) {
+        voxel_size_ = voxel_size;
+        min_persistence_ = min_persistence;
+    }
+    
+private:
+    std::string quantize_point_key(const Eigen::Vector3d& pt) {
+        // Create a unique key based on quantized position
+        int x = std::round(pt.x() / voxel_size_);
+        int y = std::round(pt.y() / voxel_size_);
+        int z = std::round(pt.z() / voxel_size_);
+        return std::to_string(x) + "_" + std::to_string(y) + "_" + std::to_string(z);
+    }
+    
+    PointCloudData create_persistent_pointcloud(const PointCloudData& original) {
+        PointCloudData filtered;
+        std::vector<int> persistent_indices;
+        
+        // Find points that are highly persistent
+        for (int i = 0; i < original.points.rows(); ++i) {
+            Eigen::Vector3d pt = original.points.row(i);
+            std::string key = quantize_point_key(pt);
+            
+            auto it = persistent_points_.find(key);
+            if (it != persistent_points_.end() && it->second.persistence_count >= min_persistence_) {
+                persistent_indices.push_back(i);
+            }
+        }
+        
+        // Create filtered cloud
+        filtered.points.resize(persistent_indices.size(), 3);
+        filtered.velocities.resize(persistent_indices.size());
+        filtered.normals.resize(persistent_indices.size(), 3);
+        
+        for (size_t j = 0; j < persistent_indices.size(); ++j) {
+            int idx = persistent_indices[j];
+            filtered.points.row(j) = original.points.row(idx);
+            filtered.velocities(j) = original.velocities(idx);
+            if (original.normals.rows() > 0) {
+                filtered.normals.row(j) = original.normals.row(idx);
+            }
+        }
+        
+        // Copy timestamps
+        filtered.frame_timestamp_seconds = original.frame_timestamp_seconds;
+        filtered.frame_timestamp_nanoseconds = original.frame_timestamp_nanoseconds;
+        
+        RCLCPP_INFO(rclcpp::get_logger("persistence_filter"), 
+                   "Persistent points: %zu/%ld (%.1f%%)", 
+                   persistent_indices.size(), original.points.rows(),
+                   (100.0 * persistent_indices.size()) / original.points.rows());
+        
+        return filtered;
     }
 };
 
@@ -176,18 +294,23 @@ public:
                           target_frame_time_(0.0),
                           enable_recording_(false) {
         // Parameters with lists for multiple executions
-        declare_parameter("frames_directory", "/home/zassi/test_lidar/data/indoore_dence/dense_six_column");
+        declare_parameter("frames_directory", "/home/zassi/test_lidar/data/outdoor/outdoor_stationary_scene/outdoor_stationary_scene/stationary_six_column_csv");
         declare_parameter("output_csv_path", "/home/zassi/ros2_ws/icp_pose/outdoor.csv");
         
         // NEW: MCAP recording parameters
         declare_parameter("enable_recording", true);
         declare_parameter("recording_directory", "./recordings");
         
+        // NEW: Persistence filter parameters (as arrays like other parameters)
+        declare_parameter("enable_persistence_filter", std::vector<bool>{true});
+        declare_parameter("persistence_voxel_size", std::vector<double>{0.15});
+        declare_parameter("min_persistence_frames", std::vector<int>{8});
+        
         // NEW: Parameter lists for multiple executions
-        declare_parameter("velocity_threshold", std::vector<double>{5.0});
+        declare_parameter("velocity_threshold", std::vector<double>{0.1});
         declare_parameter("downsample_factor", std::vector<int>{1});  
         declare_parameter("max_iterations", std::vector<int>{10});     
-        declare_parameter("icp_tolerance", std::vector<double>{1e-2});    
+        declare_parameter("icp_tolerance", std::vector<double>{1e-9});    
         declare_parameter("publish_rate", std::vector<double>{10.0});
         declare_parameter("lambda_doppler_start", std::vector<double>{0.0});
         declare_parameter("lambda_doppler_end", std::vector<double>{0.0});
@@ -195,22 +318,22 @@ public:
         declare_parameter("frame_dt", std::vector<double>{0.1});
         declare_parameter("t_vl_x", std::vector<double>{0.0});
         declare_parameter("t_vl_y", std::vector<double>{0.0});
-        declare_parameter("t_vl_z", std::vector<double>{0.604});
+        declare_parameter("t_vl_z", std::vector<double>{0.0});
         declare_parameter("reject_outliers", std::vector<bool>{true});
-        declare_parameter("outlier_thresh", std::vector<double>{1.0});
+        declare_parameter("outlier_thresh", std::vector<double>{0.1});
         declare_parameter("rejection_min_iters", std::vector<int>{2});
         declare_parameter("geometric_min_iters", std::vector<int>{0});
         declare_parameter("doppler_min_iters", std::vector<int>{2});
-        declare_parameter("geometric_k", std::vector<double>{0.1});
-        declare_parameter("doppler_k", std::vector<double>{0.15});
-        declare_parameter("max_corr_distance", std::vector<double>{0.2});  
+        declare_parameter("geometric_k", std::vector<double>{0.2});
+        declare_parameter("doppler_k", std::vector<double>{0.3});
+        declare_parameter("max_corr_distance", std::vector<double>{0.1});  
         declare_parameter("min_inliers", std::vector<int>{5});
-        declare_parameter("last_n_frames", std::vector<int>{5});        
+        declare_parameter("last_n_frames", std::vector<int>{15});        
         declare_parameter("use_voxel_filter", std::vector<bool>{false});
         declare_parameter("voxel_size", std::vector<double>{0.0001});
         
         // NEW: Adaptive normal estimation parameters
-        declare_parameter("normal_estimation_mode", std::vector<std::string>{"estimated"}); // "auto", "vertical", "estimated"
+        declare_parameter("normal_estimation_mode", std::vector<std::string>{"vertical"}); // "auto", "vertical", "estimated"
         declare_parameter("static_scene_threshold", std::vector<double>{0.5}); // Z-variance threshold for static scene detection
 
         frames_dir_ = get_parameter("frames_directory").as_string();
@@ -300,6 +423,11 @@ public:
 private:
     // NEW: Parameter combination structure
     struct ParameterSet {
+        // NEW: Persistence filter parameters
+        bool enable_persistence_filter;
+        double persistence_voxel_size;
+        int min_persistence_frames;
+        
         double velocity_threshold;
         int downsample_factor;
         int max_iterations;
@@ -351,6 +479,12 @@ private:
     bool enable_recording_;
     std::string recording_directory_;
     std::string recording_filename_;
+
+    // NEW: Persistence filter variables
+    TemporalPersistenceFilter persistence_filter_;
+    bool enable_persistence_filter_;
+    double persistence_voxel_size_;
+    int min_persistence_frames_;
 
     // NEW: Initialize MCAP recording
     void initialize_recording() {
@@ -407,6 +541,11 @@ private:
 
     // NEW: Initialize all parameter combinations
     void initialize_parameter_combinations() {
+        // NEW: Persistence filter parameters
+        auto enable_persistence_filters = get_parameter("enable_persistence_filter").as_bool_array();
+        auto persistence_voxel_sizes = get_parameter("persistence_voxel_size").as_double_array();
+        auto min_persistence_frames_list = get_parameter("min_persistence_frames").as_integer_array();
+        
         auto velocity_thresholds = get_parameter("velocity_threshold").as_double_array();
         auto downsample_factors = get_parameter("downsample_factor").as_integer_array();
         auto max_iterations_list = get_parameter("max_iterations").as_integer_array();
@@ -439,6 +578,8 @@ private:
         // Create all combinations (for simplicity, using the first combination approach)
         // You can extend this to generate all possible combinations if needed
         size_t max_size = std::max({
+            // NEW: Persistence filter parameters
+            enable_persistence_filters.size(), persistence_voxel_sizes.size(), min_persistence_frames_list.size(),
             velocity_thresholds.size(), downsample_factors.size(), max_iterations_list.size(),
             icp_tolerances.size(), publish_rates.size(), lambda_doppler_starts.size(),
             lambda_doppler_ends.size(), lambda_schedule_iters_list.size(), frame_dts.size(),
@@ -454,6 +595,12 @@ private:
 
         for (size_t i = 0; i < max_size; ++i) {
             ParameterSet params;
+            
+            // NEW: Persistence filter parameters
+            params.enable_persistence_filter = i < enable_persistence_filters.size() ? enable_persistence_filters[i] : enable_persistence_filters[0];
+            params.persistence_voxel_size = i < persistence_voxel_sizes.size() ? persistence_voxel_sizes[i] : persistence_voxel_sizes[0];
+            params.min_persistence_frames = i < min_persistence_frames_list.size() ? min_persistence_frames_list[i] : min_persistence_frames_list[0];
+            
             params.velocity_threshold = i < velocity_thresholds.size() ? velocity_thresholds[i] : velocity_thresholds[0];
             params.downsample_factor = i < downsample_factors.size() ? downsample_factors[i] : downsample_factors[0];
             params.max_iterations = i < max_iterations_list.size() ? max_iterations_list[i] : max_iterations_list[0];
@@ -499,6 +646,12 @@ private:
         const auto& params = parameter_sets_[param_index];
         current_param_index_ = param_index;
 
+        // NEW: Set persistence filter parameters
+        enable_persistence_filter_ = params.enable_persistence_filter;
+        persistence_voxel_size_ = params.persistence_voxel_size;
+        min_persistence_frames_ = params.min_persistence_frames;
+        persistence_filter_.set_parameters(persistence_voxel_size_, min_persistence_frames_);
+
         // Set all current parameters
         velocity_threshold_ = params.velocity_threshold;
         downsample_factor_ = params.downsample_factor;
@@ -530,8 +683,9 @@ private:
         static_scene_threshold_ = params.static_scene_threshold;
 
         RCLCPP_INFO(get_logger(), "Set parameter combination %zu/%zu", param_index + 1, parameter_sets_.size());
-        RCLCPP_INFO(get_logger(), "Normal estimation mode: %s, Static scene threshold: %.3f", 
-                   normal_estimation_mode_.c_str(), static_scene_threshold_);
+        RCLCPP_INFO(get_logger(), "Persistence filter: %s (voxel=%.2f, min_frames=%d)", 
+                   enable_persistence_filter_ ? "ENABLED" : "DISABLED",
+                   persistence_voxel_size_, min_persistence_frames_);
     }
 
     // NEW: Enhanced CSV file initialization
@@ -563,7 +717,8 @@ private:
                  << "geometric_min_iters,doppler_min_iters,geometric_k,doppler_k,max_corr_distance,"
                  << "min_inliers,last_n_frames,frame_timestamp_seconds,frame_timestamp_nanoseconds,"
                  << "use_voxel_filter,voxel_size,parameter_set_index,"
-                 << "normal_estimation_mode,static_scene_threshold\n";
+                 << "normal_estimation_mode,static_scene_threshold,"
+                 << "enable_persistence_filter,persistence_voxel_size,min_persistence_frames\n";
         csv_file_.flush();
         
         RCLCPP_INFO(get_logger(), "Initialized enhanced trajectory CSV file: %s", excel_filename_.c_str());
@@ -661,7 +816,10 @@ private:
                   << voxel_size_ << ","
                   << current_param_index_ << ","
                   << current_normal_mode_ << ","
-                  << static_scene_threshold_ << "\n";
+                  << static_scene_threshold_ << ","
+                  << (enable_persistence_filter_ ? "true" : "false") << ","
+                  << persistence_voxel_size_ << ","
+                  << min_persistence_frames_ << "\n";
         
         csv_file_.flush();
     }
@@ -1186,6 +1344,11 @@ private:
             RCLCPP_DEBUG(get_logger(), "Loading frame %zu synchronously", frame_idx_);
         }
 
+        // NEW: APPLY PERSISTENCE FILTER - KEY ADDITION
+        if (enable_persistence_filter_ && frame_idx_ > 5) { // Wait a few frames to initialize
+            frame_data = persistence_filter_.filter_non_persistent_points(frame_data);
+        }
+
         // Start preprocessing NEXT frame while current frame processes
         if (frame_idx_ + 1 < frame_files_.size() && !preprocessing_next_frame_.load()) {
             next_frame_idx_ = frame_idx_ + 1;
@@ -1460,6 +1623,7 @@ private:
     std::string normal_estimation_mode_;
     double static_scene_threshold_;
     std::string current_normal_mode_ = "estimated";
+
 
     // NEW: Parameter combinations
     std::vector<ParameterSet> parameter_sets_;
