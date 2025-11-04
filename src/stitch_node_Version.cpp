@@ -303,8 +303,8 @@ public:
         
         // NEW: Persistence filter parameters (as arrays like other parameters)
         declare_parameter("enable_persistence_filter", std::vector<bool>{true});
-        declare_parameter("persistence_voxel_size", std::vector<double>{0.15});
-        declare_parameter("min_persistence_frames", std::vector<int>{8});
+        declare_parameter("persistence_voxel_size", std::vector<double>{1.0});
+        declare_parameter("min_persistence_frames", std::vector<int>{10});
         
         // NEW: Parameter lists for multiple executions
         declare_parameter("velocity_threshold", std::vector<double>{0.1});
@@ -485,6 +485,9 @@ private:
     bool enable_persistence_filter_;
     double persistence_voxel_size_;
     int min_persistence_frames_;
+
+    // NEW: Points after persistence filter tracking
+    size_t current_frame_points_after_persistence_ = 0;
 
     // NEW: Initialize MCAP recording
     void initialize_recording() {
@@ -744,15 +747,15 @@ private:
             return;
         }
         
-        // Header for logs file
+        // Header for logs file - UPDATED WITH NEW COLUMN
         logs_file_ << "frame_index,filename,initial_points,filtered_points,"
-                  << "iterations_used,processing_time_ms\n";
+                  << "points_after_persistence,iterations_used,processing_time_ms\n";
         logs_file_.flush();
         
         RCLCPP_INFO(get_logger(), "Initialized execution logs file: %s", logs_filename_.c_str());
     }
 
-    // NEW: Save frame statistics to logs file
+    // NEW: Save frame statistics to logs file - UPDATED WITH NEW COLUMN
     void save_frame_stats_to_logs(const FrameStats& stats) {
         if (!logs_file_.is_open()) return;
         
@@ -761,6 +764,7 @@ private:
                   << stats.filename << ","
                   << stats.initial_points << ","
                   << stats.filtered_points << ","
+                  << current_frame_points_after_persistence_ << ","  // NEW COLUMN
                   << stats.iterations_used << ","
                   << stats.processing_time_ms << "\n";
         
@@ -1344,9 +1348,21 @@ private:
             RCLCPP_DEBUG(get_logger(), "Loading frame %zu synchronously", frame_idx_);
         }
 
-        // NEW: APPLY PERSISTENCE FILTER - KEY ADDITION
-        if (enable_persistence_filter_ && frame_idx_ > 5) { // Wait a few frames to initialize
+        // NEW: Initialize points count before persistence filter
+        current_frame_points_after_persistence_ = frame_data.points.rows();
+
+        // APPLY PERSISTENCE FILTER - KEY ADDITION
+        if (enable_persistence_filter_ && frame_idx_ > 5) {
             frame_data = persistence_filter_.filter_non_persistent_points(frame_data);
+            
+            // NEW: Update points count after persistence filter
+            current_frame_points_after_persistence_ = frame_data.points.rows();
+            
+            RCLCPP_INFO(get_logger(), 
+                       "Persistence filter: %zu → %zu points (%.1f%% kept)", 
+                       current_frame_filtered_points_,  // from load_frame
+                       current_frame_points_after_persistence_,
+                       (100.0 * current_frame_points_after_persistence_) / current_frame_filtered_points_);
         }
 
         // Start preprocessing NEXT frame while current frame processes
@@ -1632,6 +1648,7 @@ private:
     // NEW: Frame statistics tracking
     size_t current_frame_initial_points_ = 0;
     size_t current_frame_filtered_points_ = 0;
+    //size_t current_frame_points_after_persistence_ = 0;  // NEW: Points after persistence filter
     int current_frame_iterations_ = 0;
 
     size_t frame_idx_;
